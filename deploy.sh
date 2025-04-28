@@ -1,8 +1,14 @@
 #!/bin/bash
 
 # 大运维平台自动部署脚本 - 第一版
-# 日期: 2025-04-27
+# 日期: 2025-04-28
 # 作者: chenJi897
+
+# 检查是否使用bash运行
+if [ -z "$BASH_VERSION" ]; then
+    echo "错误: 此脚本必须使用bash运行" >&2
+    exit 1
+fi
 
 # 获取脚本所在目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +28,18 @@ CONFIG_FILE=""          # 自定义配置文件
 MODULES=""              # 要部署的模块
 LOG_FILE="/tmp/deploy_$(date +%Y%m%d%H%M%S).log" # 日志文件
 MODULES_TO_DEPLOY=()    # 要部署的模块数组
+DEBUG=false             # 调试模式
+
+# 错误标志
+INVALID_ARGS=false
+
+# 保存命令行参数值，避免被配置文件覆盖
+CMDLINE_MYSQL_PORT=""
+CMDLINE_MYSQL_PASSWORD=""
+CMDLINE_MYSQL_DATA_DIR=""
+CMDLINE_REDIS_PORT=""
+CMDLINE_REDIS_PASSWORD=""
+CMDLINE_REDIS_DATA_DIR=""
 
 # 显示帮助信息
 show_help() {
@@ -39,19 +57,31 @@ show_help() {
     --log=FILE            指定日志文件
     --list-modules        列出可用模块
     --help                显示此帮助信息
+    
+    # MySQL特定参数
+    --mysql-port=NUM      指定MySQL端口
+    --mysql-password=PASS 指定MySQL密码
+    --mysql-data-dir=PATH 指定MySQL数据目录
+    
+    # Redis特定参数
+    --redis-port=NUM      指定Redis端口
+    --redis-password=PASS 指定Redis密码
+    --redis-data-dir=PATH 指定Redis数据目录
+    
+    # 调试选项
+    --debug               启用调试模式
 
 示例:
     $0 --arch=ha --modules=mysql,redis
     $0 --version=2.0 --modules=all
+    $0 --modules=mysql --mysql-port=3308 --mysql-password="NewPwd2025"
 EOF
 }
-
-
 
 # 默认主配置文件路径
 MAIN_CONFIG_FILE="$SCRIPT_DIR/deploy.conf"
 
-# 加载配置函数修改
+# 加载配置函数
 load_config() {
     # 首先加载主配置文件（如果存在）
     if [[ -f "$MAIN_CONFIG_FILE" ]]; then
@@ -72,21 +102,61 @@ load_config() {
     fi
     
     # 加载用户指定的自定义配置（如果指定）
-    # 这个配置会覆盖主配置文件和架构配置
     if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
         log_info "加载自定义配置: $CONFIG_FILE"
         source "$CONFIG_FILE"
     fi
+    
+    # 恢复命令行参数值，使命令行参数优先级高于配置文件
+    [[ -n "$CMDLINE_MYSQL_PORT" ]] && MYSQL_PORT="$CMDLINE_MYSQL_PORT"
+    [[ -n "$CMDLINE_MYSQL_PASSWORD" ]] && MYSQL_PASSWORD="$CMDLINE_MYSQL_PASSWORD"
+    [[ -n "$CMDLINE_MYSQL_DATA_DIR" ]] && MYSQL_DATA_DIR="$CMDLINE_MYSQL_DATA_DIR"
+    [[ -n "$CMDLINE_REDIS_PORT" ]] && REDIS_PORT="$CMDLINE_REDIS_PORT"
+    [[ -n "$CMDLINE_REDIS_PASSWORD" ]] && REDIS_PASSWORD="$CMDLINE_REDIS_PASSWORD"
+    [[ -n "$CMDLINE_REDIS_DATA_DIR" ]] && REDIS_DATA_DIR="$CMDLINE_REDIS_DATA_DIR"
+    
+    # 输出调试信息
+    if [[ "$DEBUG" == "true" ]]; then
+        log_info "配置加载后的值:"
+        log_info "- MYSQL_PORT = $MYSQL_PORT"
+        log_info "- MYSQL_PASSWORD = $MYSQL_PASSWORD"
+        log_info "- MYSQL_DATA_DIR = $MYSQL_DATA_DIR"
+        log_info "- REDIS_PORT = $REDIS_PORT"
+        log_info "- REDIS_PASSWORD = $REDIS_PASSWORD"
+    fi
+    
+    # 导出关键配置变量，使它们对子进程可见
+    export MYSQL_PORT
+    export MYSQL_PASSWORD
+    export MYSQL_DATA_DIR
+    export MYSQL_MAX_CONNECTIONS
+    export MYSQL_BUFFER_POOL_SIZE_PERCENT
+    
+    export REDIS_PORT
+    export REDIS_PASSWORD
+    export REDIS_DATA_DIR
+    export REDIS_MAX_MEMORY
+    
+    export ROCKETMQ_NAMESRV_PORT
+    export ROCKETMQ_BROKER_PORT
+    export ROCKETMQ_DATA_DIR
+    export ROCKETMQ_NAMESRV_MEMORY
+    export ROCKETMQ_BROKER_MEMORY
+    
+    export NACOS_PORT
+    export NACOS_HOME
+    export NACOS_DB_TYPE
+    export NACOS_JVM_XMS
+    export NACOS_JVM_XMX
+    
+    export ES_PORT
+    export ES_DATA_DIR
+    export ES_JVM_SIZE
+    
+    export DEPLOY_VERSION
+    export DEPLOY_ARCH
+    export ARCHITECTURE
 }
-
-
-
-
-
-
-
-
-
 
 # 列出可用模块
 list_modules() {
@@ -140,8 +210,40 @@ parse_args() {
                 show_help
                 exit 0
                 ;;
+            --debug)
+                DEBUG=true
+                export DEBUG
+                ;;
+            # MySQL特定参数 - 保存到专门的命令行参数变量
+            --mysql-port=*)
+                CMDLINE_MYSQL_PORT="${arg#*=}"
+                MYSQL_PORT="$CMDLINE_MYSQL_PORT"  # 也设置常规变量，确保优先生效
+                ;;
+            --mysql-password=*)
+                CMDLINE_MYSQL_PASSWORD="${arg#*=}"
+                MYSQL_PASSWORD="$CMDLINE_MYSQL_PASSWORD"
+                ;;
+            --mysql-data-dir=*)
+                CMDLINE_MYSQL_DATA_DIR="${arg#*=}"
+                MYSQL_DATA_DIR="$CMDLINE_MYSQL_DATA_DIR"
+                ;;
+            # Redis特定参数
+            --redis-port=*)
+                CMDLINE_REDIS_PORT="${arg#*=}"
+                REDIS_PORT="$CMDLINE_REDIS_PORT"
+                ;;
+            --redis-password=*)
+                CMDLINE_REDIS_PASSWORD="${arg#*=}"
+                REDIS_PASSWORD="$CMDLINE_REDIS_PASSWORD"
+                ;;
+            --redis-data-dir=*)
+                CMDLINE_REDIS_DATA_DIR="${arg#*=}"
+                REDIS_DATA_DIR="$CMDLINE_REDIS_DATA_DIR"
+                ;;
             *)
-                echo "未知选项: $arg"
+                echo "错误: 无效的参数 '$arg'"
+                echo "使用 --help 查看帮助信息"
+                INVALID_ARGS=true
                 ;;
         esac
     done
@@ -149,33 +251,30 @@ parse_args() {
     # 初始化日志
     log_init "$LOG_FILE"
     
+    # 如果有无效参数，显示帮助信息并退出
+    if [[ "$INVALID_ARGS" == "true" ]]; then
+        echo ""
+        echo "存在无效参数，部署终止。请检查参数后重试。"
+        echo ""
+        show_help
+        exit 1
+    fi
+    
+    # 调试信息
+    if [[ "$DEBUG" == "true" ]]; then
+        log_info "命令行解析的参数:"
+        [[ -n "$CMDLINE_MYSQL_PORT" ]] && log_info "- CMDLINE_MYSQL_PORT = $CMDLINE_MYSQL_PORT"
+        [[ -n "$CMDLINE_MYSQL_PASSWORD" ]] && log_info "- CMDLINE_MYSQL_PASSWORD = $CMDLINE_MYSQL_PASSWORD"
+        [[ -n "$CMDLINE_REDIS_PORT" ]] && log_info "- CMDLINE_REDIS_PORT = $CMDLINE_REDIS_PORT"
+    fi
+    
     log_info "部署配置:"
     log_info "- 平台: $PLATFORM"
     log_info "- 版本: $APP_VERSION"
     log_info "- 架构: $ARCHITECTURE" 
     log_info "- 模块: ${MODULES:-全部}"
     log_info "- 日志文件: $LOG_FILE"
-}
-
-# 加载配置
-load_config() {
-    # 加载版本配置（如果存在）
-    if [[ -f "${SCRIPT_DIR}/config/versions/${APP_VERSION}.conf" ]]; then
-        log_info "加载版本配置: $APP_VERSION"
-        source "${SCRIPT_DIR}/config/versions/${APP_VERSION}.conf"
-    fi
-    
-    # 加载架构配置（如果存在）
-    if [[ -f "${SCRIPT_DIR}/config/architectures/${ARCHITECTURE}.conf" ]]; then
-        log_info "加载架构配置: $ARCHITECTURE"
-        source "${SCRIPT_DIR}/config/architectures/${ARCHITECTURE}.conf"
-    fi
-    
-    # 加载自定义配置（如果指定）
-    if [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]]; then
-        log_info "加载自定义配置: $CONFIG_FILE"
-        source "$CONFIG_FILE"
-    fi
+    [[ "$DEBUG" == "true" ]] && log_info "- 调试模式: 已启用"
 }
 
 # 获取要部署的模块列表
@@ -261,9 +360,38 @@ deploy_module() {
     log_section "部署模块: $module"
     
     # 构建部署参数
-    local deploy_args="--arch=$ARCHITECTURE"
+    local deploy_args=""
     
-    # 执行部署脚本
+    # 通用参数
+    deploy_args+=" --arch=$ARCHITECTURE"
+    [[ "$DEBUG" == "true" ]] && deploy_args+=" --debug"
+    
+    # 模块特定参数 - 使用Case语句根据模块类型添加特定参数
+    case $module in
+        mysql)
+            # 直接使用port而非mysql-port，因为模块脚本接受的是--port参数
+            [[ -n "$MYSQL_PORT" ]] && deploy_args+=" --port=$MYSQL_PORT"
+            [[ -n "$MYSQL_PASSWORD" ]] && deploy_args+=" --password=$MYSQL_PASSWORD"
+            [[ -n "$MYSQL_DATA_DIR" ]] && deploy_args+=" --data-dir=$MYSQL_DATA_DIR"
+            ;;
+        redis)
+            [[ -n "$REDIS_PORT" ]] && deploy_args+=" --port=$REDIS_PORT"
+            [[ -n "$REDIS_PASSWORD" ]] && deploy_args+=" --password=$REDIS_PASSWORD"
+            [[ -n "$REDIS_DATA_DIR" ]] && deploy_args+=" --data-dir=$REDIS_DATA_DIR"
+            ;;
+        nacos)
+            [[ -n "$NACOS_PORT" ]] && deploy_args+=" --port=$NACOS_PORT"
+            [[ -n "$NACOS_DB_TYPE" ]] && deploy_args+=" --db-type=$NACOS_DB_TYPE"
+            ;;
+        # 其他模块参数可以根据需要添加
+    esac
+    
+    # 打印执行命令(调试模式)
+    if [[ "$DEBUG" == "true" ]]; then
+        log_info "执行命令: bash \"$module_dir/deploy.sh\"$deploy_args"
+    fi
+    
+    # 执行部署脚本 - 修正命令格式，确保在脚本路径和参数之间有空格
     bash "$module_dir/deploy.sh" $deploy_args
     
     local status=$?
@@ -355,4 +483,3 @@ main() {
 
 # 执行主函数
 main "$@"
-
